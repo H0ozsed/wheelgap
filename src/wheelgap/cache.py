@@ -98,7 +98,8 @@ def _own_folder(folder: Path) -> bool:
     if not stat.S_ISDIR(info.st_mode):
         return False
     # Python 3.11 on Windows reports a junction as a plain folder; its reparse tag gives it away.
-    if getattr(info, "st_reparse_tag", 0) and info.st_reparse_tag == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", -1):
+    tag = getattr(info, "st_reparse_tag", 0)  # Windows only
+    if tag and tag == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", -1):
         return False
     isjunction = getattr(os.path, "isjunction", None)  # Python 3.12+
     return not (isjunction is not None and isjunction(folder))
