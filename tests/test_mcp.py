@@ -1,5 +1,7 @@
 import io
 import json
+import threading
+from collections.abc import Callable, Iterator
 
 import pytest
 
@@ -252,9 +254,10 @@ def test_check_lockfile_argparse_exit_is_a_tool_error(monkeypatch, fixtures):
         raise SystemExit(2)
 
     monkeypatch.setattr(cli, "main", exits)
-    (_, reply, ping) = run(
+    replies = run(
         init(), call("check_lockfile", path=str(fixtures / "uvproj")), {"jsonrpc": "2.0", "id": 9, "method": "ping"}
     )
+    reply, ping = (next(r for r in replies if r["id"] == i) for i in (1, 9))  # the call runs on the worker
     assert reply["result"]["isError"] is True
     assert ping["result"] == {}
 
@@ -415,7 +418,8 @@ def test_crash_in_a_tool_is_reported_not_fatal(monkeypatch):
         raise KeyError("boom")
 
     monkeypatch.setitem(mcp._HANDLERS, "list_targets", broken)
-    (_, reply, ping) = run(init(), call("list_targets"), {"jsonrpc": "2.0", "id": 5, "method": "ping"})
+    replies = run(init(), call("list_targets"), {"jsonrpc": "2.0", "id": 5, "method": "ping"})
+    reply, ping = (next(r for r in replies if r["id"] == i) for i in (1, 5))  # the call runs on the worker
     assert reply["result"]["isError"] is True
     assert "KeyError" in reply["result"]["content"][0]["text"]
     assert ping["result"] == {}
@@ -450,3 +454,193 @@ def test_real_stdio(fixtures):
 @pytest.mark.parametrize(("argv", "code"), [(["--version"], 0), (["--help"], 0), (["--bogus"], 2)])
 def test_main_flags(argv, code, capsys):
     assert mcp.main(argv) == code
+
+
+def with_token(message: dict, token: object) -> dict:
+    message["params"]["_meta"] = {"progressToken": token}
+    return message
+
+
+def ping(msg_id: int) -> dict:
+    return {"jsonrpc": "2.0", "id": msg_id, "method": "ping"}
+
+
+def is_progress(m: dict) -> bool:
+    return m.get("method") == "notifications/progress"
+
+
+class Recorder:
+    """A stdout for serve that keeps the messages and lets the test wait for one."""
+
+    def __init__(self) -> None:
+        self.messages: list[dict] = []
+        self._changed = threading.Condition()
+
+    def write(self, data: bytes) -> None:
+        with self._changed:
+            self.messages += [json.loads(line) for line in data.splitlines()]
+            self._changed.notify_all()
+
+    def flush(self) -> None:
+        pass
+
+    def wait_for(self, predicate: Callable[[dict], bool]) -> Callable[[], None]:
+        def wait() -> None:
+            with self._changed:
+                assert self._changed.wait_for(lambda: any(predicate(m) for m in self.messages), timeout=10)
+
+        return wait
+
+
+def live(*steps: object) -> Iterator[bytes]:
+    """A stdin for serve: messages are sent one per line, and callables run before the next line is read."""
+    for step in steps:
+        if callable(step):
+            step()
+        else:
+            yield json.dumps(step).encode() + b"\n"
+
+
+@pytest.fixture
+def slow_pypi(fake_pypi, monkeypatch):
+    """fake_pypi, but every lookup waits until the test sets the returned event."""
+    from wheelgap import pypi
+
+    release = threading.Event()
+    fast = pypi.fetch_json
+
+    def fetch_json(url, timeout=20.0):
+        assert release.wait(10), "the test never released the lookups"
+        return fast(url, timeout)
+
+    monkeypatch.setattr(pypi, "fetch_json", fetch_json)
+    return release
+
+
+@pytest.fixture
+def three_pins(tmp_path):
+    path = tmp_path / "requirements.txt"
+    path.write_text("purewheel==3.1\nnowheels==0.9\nwinonly==311\n", encoding="utf-8")
+    return str(path)
+
+
+@pytest.mark.parametrize(("version", "token"), [("2025-06-18", "tok"), ("2024-11-05", 7)])
+def test_check_lockfile_sends_progress_with_a_token(fake_pypi, three_pins, tmp_path, version, token):
+    other = tmp_path / "other.txt"  # not yet cached, so the call without a token really looks it up
+    other.write_text("fastlib==2.0.0\n", encoding="utf-8")
+    replies = run(
+        init(version),
+        with_token(call("check_lockfile", path=three_pins, python="3.13"), token),
+        call("check_lockfile", 2, path=str(other), python="3.13"),  # no token, no progress
+    )
+    progress = [r["params"] for r in replies if is_progress(r)]
+    assert [(p["progressToken"], p["progress"], p["total"]) for p in progress] == [(token, n, 3) for n in range(4)]
+    # message arrived in 2025-03-26.
+    assert all(("message" in p) == (version != "2024-11-05") for p in progress)
+    assert [r.get("id") for r in replies if not is_progress(r)] == [0, 1, 2]
+    assert replies.index(next(r for r in replies if r.get("id") == 1)) > replies.index(
+        next(filter(is_progress, replies))
+    )
+
+
+def test_check_package_sends_progress_with_a_token(fake_pypi):
+    replies = run(init(), with_token(call("check_package", name="purewheel", python="3.13"), "t"))
+    assert [r["params"]["progress"] for r in replies if is_progress(r)] == [0, 1]
+    assert replies[-1]["id"] == 1 and replies[-1]["result"]["isError"] is False
+
+
+def test_progress_counts_up_over_several_lookup_runs():
+    sent: list[object] = []
+    server = mcp.Server(sent.append)
+    call_ = mcp._Call("t")
+    for done, total in [(0, 2), (1, 2), (2, 2), (0, 3), (1, 3), (2, 3), (3, 3)]:  # e.g. a lock re-check
+        server._progress(call_, done, total)
+    server.close()
+    assert [(m["params"]["progress"], m["params"]["total"]) for m in sent] == [
+        (0, 2),
+        (1, 2),
+        (2, 2),
+        (3, 5),
+        (4, 5),
+        (5, 5),
+    ]
+
+
+def test_ping_is_answered_while_a_call_runs(slow_pypi, three_pins):
+    out = Recorder()
+    mcp.serve(
+        live(
+            init(),
+            with_token(call("check_lockfile", path=three_pins, python="3.13"), "t"),
+            out.wait_for(is_progress),  # the call is running, its lookups held
+            ping(5),
+            out.wait_for(lambda m: m.get("id") == 5),
+            slow_pypi.set,
+        ),
+        out,
+    )
+    assert [m["id"] for m in out.messages if "id" in m] == [0, 5, 1]
+    assert out.messages[-1]["result"]["structuredContent"]["packages"] == 3
+    assert [m["params"]["progress"] for m in out.messages if is_progress(m)] == [0, 1, 2, 3]
+
+
+def test_cancelled_call_sends_no_result_or_more_progress(slow_pypi, three_pins):
+    out = Recorder()
+    mcp.serve(
+        live(
+            init(),
+            with_token(call("check_lockfile", path=three_pins, python="3.13"), "t"),
+            out.wait_for(is_progress),
+            {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1, "reason": "user"}},
+            ping(5),
+            out.wait_for(lambda m: m.get("id") == 5),  # the cancel has been handled
+            slow_pypi.set,
+            call("list_targets", 2),  # the server carries on
+        ),
+        out,
+    )
+    assert [m["id"] for m in out.messages if "id" in m] == [0, 5, 2]
+    assert [m["params"]["progress"] for m in out.messages if is_progress(m)] == [0]
+
+
+def test_call_cancelled_while_queued_never_runs(fake_pypi, slow_pypi, three_pins):
+    out = Recorder()
+    mcp.serve(
+        live(
+            init(),
+            with_token(call("check_lockfile", path=three_pins, python="3.13"), "t"),
+            out.wait_for(is_progress),
+            call("check_package", 2, name="fastlib", python="3.13"),  # waits for the worker
+            {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}},
+            ping(5),
+            out.wait_for(lambda m: m.get("id") == 5),
+            slow_pypi.set,
+        ),
+        out,
+    )
+    assert [m["id"] for m in out.messages if "id" in m] == [0, 5, 1]
+    assert fake_pypi and not any("fastlib" in url for url in fake_pypi)
+
+
+def test_batch_with_a_call_still_gets_one_list(fake_pypi):
+    (reply,) = run([call("list_targets", 1), ping(2), {"jsonrpc": "2.0", "method": "notifications/initialized"}])
+    assert [r["id"] for r in reply] == [1, 2]
+    assert reply[0]["result"]["isError"] is False
+
+
+def test_a_result_that_isnt_json_is_still_answered(monkeypatch):
+    monkeypatch.setitem(mcp._HANDLERS, "list_targets", lambda args: {"x": {1}})
+    (_, reply) = run(init(), call("list_targets"))
+    assert reply["id"] == 1
+    assert reply["result"]["isError"] is True
+    assert "TypeError" in reply["result"]["content"][0]["text"]
+
+
+def test_a_crash_on_the_worker_is_still_answered(monkeypatch):
+    def broken(self, name, arguments):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mcp.Server, "_call", broken)
+    (_, reply) = run(init(), call("list_targets"))
+    assert reply["id"] == 1
+    assert reply["error"]["code"] == mcp.INTERNAL_ERROR

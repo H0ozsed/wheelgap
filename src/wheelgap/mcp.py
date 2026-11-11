@@ -5,6 +5,11 @@ stdio: one JSON-RPC 2.0 message per line on stdin and stdout, using the initiali
 2025-11-25 protocol revisions. Newer clients that first probe with server/discover get "method not found" and fall
 back to that handshake. Like the rest of wheelgap it needs only the standard library and packaging.
 
+Tool calls run on one worker thread, one at a time, while the main thread keeps reading stdin: it answers ping and
+handles notifications/cancelled during a long check_lockfile. One worker, because check_lockfile redirects the
+process-wide sys.stdout and sys.stderr around cli.main. A call given a _meta.progressToken gets
+notifications/progress as its index lookups finish; a cancelled call sends no more of them, and no result.
+
 Tools (all read-only; they look packages up on PyPI, or the index in WHEELGAP_INDEX_URL):
 - check_package: one package (latest release or a given version) on each target.
 - check_lockfile: what `wheelgap PATH --json` reports, so project config, notes and skipped packages match the CLI.
@@ -18,13 +23,15 @@ import io
 import json
 import re
 import sys
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, BinaryIO
 
 from packaging.version import InvalidVersion, Version
 
-from . import __version__
+from . import __version__, pypi
 from .api import Result, check_package, make_targets, running_python
 from .check import Status
 from .pyodide import PyodideLockError, load_pyodide_lock
@@ -46,6 +53,7 @@ from .targets import (
 # newest, and the client decides whether it can use that (as the MCP lifecycle spec says).
 PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 _STRUCTURED_FROM = "2025-06-18"  # the first revision with structuredContent in tool results
+_PROGRESS_MESSAGE_FROM = "2025-03-26"  # the first revision with a message in notifications/progress
 
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -372,33 +380,83 @@ _HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
 }
 
 
-class Server:
-    """The protocol state for one stdio connection."""
+class _Call:
+    """A tools/call that is queued or running on the worker."""
 
-    def __init__(self) -> None:
+    def __init__(self, token: str | int | None) -> None:
+        self.token = token
+        self.cancelled = False
+        self.base = 0  # lookups in fill_all runs that have finished (check_lockfile may run more than one)
+        self.total = 0  # lookups in the current fill_all run
+        self.sent = -1  # the last progress sent: the spec says each one must be higher
+
+
+class Server:
+    """The protocol state for one stdio connection.
+
+    With `send`, tools/call runs on a worker thread and its result goes out through `send` (handle returns None for
+    it); without, handle returns the result itself.
+    """
+
+    def __init__(self, send: Callable[[object], None] | None = None) -> None:
         self.protocol_version = PROTOCOL_VERSIONS[-1]
+        self._send = send
+        self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wheelgap-mcp") if send else None
+        self._calls: dict[str | int, _Call] = {}
+        self._lock = threading.Lock()  # guards _calls and each _Call's cancelled flag
+
+    def close(self, wait: bool = True) -> None:
+        """Wait for queued and running calls to send their results (or, with wait=False, drop the queued ones)."""
+        if not wait:  # Ctrl-C: the running call may still finish its lookups, but nothing more is written
+            with self._lock:
+                for call in self._calls.values():
+                    call.cancelled = True
+                self._send = None
+        if self._worker is not None:
+            self._worker.shutdown(wait=wait, cancel_futures=not wait)
 
     def handle(self, message: object) -> dict[str, Any] | list[dict[str, Any]] | None:
-        """The response to one parsed message (or batch), or None for notifications."""
+        """The response to one parsed message (or batch), or None for notifications and calls left to the worker."""
         if isinstance(message, list):  # JSON-RPC batches (only 2025-03-26 allowed them, but they cost nothing)
             if not message:
                 return _error(None, INVALID_REQUEST, "empty batch")
-            replies = [r for r in (self._one(m) for m in message) if r is not None]
-            return replies or None
+            if self._worker is not None and any(
+                isinstance(m, dict) and m.get("method") == "tools/call" for m in message
+            ):
+                # Its reply is one array, so the whole batch waits its turn on the worker.
+                self._worker.submit(self._batch_on_worker, message)
+                return None
+            return self._batch(message)
         return self._one(message)
 
-    def _one(self, message: object) -> dict[str, Any] | None:
+    def _batch(self, message: list[object]) -> list[dict[str, Any]] | None:
+        replies = [r for r in (self._one(m, inline=True) for m in message) if r is not None]
+        return replies or None
+
+    def _batch_on_worker(self, message: list[object]) -> None:
+        try:
+            reply: object = self._batch(message)
+        except Exception as e:  # a bug: the client still gets an answer rather than waiting forever
+            reply = _error(None, INTERNAL_ERROR, f"internal error: {type(e).__name__}: {e}")
+        with self._lock:
+            if reply is not None and self._send is not None:
+                self._send(reply)
+
+    def _one(self, message: object, inline: bool = False) -> dict[str, Any] | None:
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
             return _error(_id(message), INVALID_REQUEST, "not a JSON-RPC 2.0 message")
         method = message.get("method")
+        params = message.get("params")
         if "id" not in message or ("method" not in message and ("result" in message or "error" in message)):
-            return None  # a notification (initialized, cancelled, ...) or a response to us: nothing to send
+            # A notification (initialized, cancelled, ...) or a response to us: nothing to send.
+            if method == "notifications/cancelled" and isinstance(params, dict):
+                self._cancel(params.get("requestId"))
+            return None
         msg_id = message["id"]
         if not isinstance(msg_id, (str, int)) or isinstance(msg_id, bool):
             return _error(None, INVALID_REQUEST, "id must be a string or an integer")
         if not isinstance(method, str):
             return _error(msg_id, INVALID_REQUEST, "method must be a string")
-        params = message.get("params")
         if params is None:
             params = {}
         if not isinstance(params, dict):
@@ -418,8 +476,67 @@ class Server:
                 arguments = {}
             if not isinstance(arguments, dict):
                 return _error(msg_id, INVALID_PARAMS, "arguments must be an object")
-            return _reply(msg_id, self._call(name, arguments))
+            if inline or self._worker is None:
+                return _reply(msg_id, self._call(name, arguments))
+            meta = params.get("_meta")
+            token = meta.get("progressToken") if isinstance(meta, dict) else None
+            if not isinstance(token, (str, int)) or isinstance(token, bool):
+                token = None
+            call = _Call(token)
+            with self._lock:
+                self._calls[msg_id] = call
+            self._worker.submit(self._run, msg_id, call, name, arguments)
+            return None
         return _error(msg_id, METHOD_NOT_FOUND, f"method not found: {method}")
+
+    def _cancel(self, msg_id: object) -> None:
+        """notifications/cancelled: an unknown or finished request is ignored, as the spec says."""
+        if isinstance(msg_id, (str, int)) and not isinstance(msg_id, bool):
+            with self._lock:
+                if call := self._calls.get(msg_id):
+                    call.cancelled = True
+
+    def _run(self, msg_id: str | int, call: _Call, name: str, arguments: dict[str, Any]) -> None:
+        """On the worker: run one call and send its result, unless it was cancelled."""
+        if call.cancelled:  # cancelled while it waited for the worker: don't start it
+            with self._lock:
+                if self._calls.get(msg_id) is call:
+                    del self._calls[msg_id]
+            return
+        try:
+            if call.token is None:
+                result = self._call(name, arguments)
+            else:
+                with pypi.reporting_progress(lambda done, total: self._progress(call, done, total)):
+                    result = self._call(name, arguments)
+            reply = _reply(msg_id, result)
+        except Exception as e:  # a bug: the client still gets an answer rather than waiting forever
+            reply = _error(msg_id, INTERNAL_ERROR, f"internal error: {type(e).__name__}: {e}")
+        try:
+            with self._lock:  # the lock, so a cancel handled before this point always drops the result
+                if not call.cancelled and self._send is not None:
+                    self._send(reply)
+        finally:
+            with self._lock:
+                if self._calls.get(msg_id) is call:
+                    del self._calls[msg_id]
+
+    def _progress(self, call: _Call, done: int, total: int) -> None:
+        """Called by fill_all on the worker. Progress counts up over every fill_all run in the call."""
+        if done == 0:  # a new fill_all run: the previous one (if any) finished all its lookups
+            call.base += call.total
+            call.total = total
+        progress, overall = call.base + done, call.base + call.total
+        if progress <= call.sent:
+            return
+        params: dict[str, Any] = {"progressToken": call.token, "progress": progress, "total": overall}
+        if self.protocol_version >= _PROGRESS_MESSAGE_FROM:
+            params["message"] = f"{progress} of {overall} index lookups done"
+        with self._lock:
+            if call.cancelled or self._send is None:
+                return
+            call.sent = progress
+            self._send({"jsonrpc": "2.0", "method": "notifications/progress", "params": params})
 
     def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         asked = params.get("protocolVersion")
@@ -436,11 +553,12 @@ class Server:
             # wheelgap's own messages go to stderr already; this keeps any stray print off the protocol stream.
             with contextlib.redirect_stdout(sys.stderr):
                 data = _HANDLERS[name](arguments)
+            text = json.dumps(data, indent=1)
         except (ToolError, TargetError, SourceError) as e:
             return {"content": [{"type": "text", "text": str(e)}], "isError": True}
         except Exception as e:  # a bug: report it to the model rather than end the connection
             return {"content": [{"type": "text", "text": f"internal error: {type(e).__name__}: {e}"}], "isError": True}
-        result: dict[str, Any] = {"content": [{"type": "text", "text": json.dumps(data, indent=1)}], "isError": False}
+        result: dict[str, Any] = {"content": [{"type": "text", "text": text}], "isError": False}
         if self.protocol_version >= _STRUCTURED_FROM:
             result["structuredContent"] = data
         return result
@@ -460,25 +578,37 @@ def _error(msg_id: Any, code: int, message: str) -> dict[str, Any]:
 
 
 def serve(stdin: BinaryIO, stdout: BinaryIO) -> None:
-    """Answer messages from stdin until it closes."""
-    server = Server()
-    for line in stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line.decode("utf-8-sig"))
-        except (ValueError, RecursionError) as e:  # bad UTF-8 or JSON, an over-long integer, absurd nesting
-            reply: object = _error(None, PARSE_ERROR, f"parse error: {type(e).__name__}")
-        else:
-            try:
-                reply = server.handle(message)
-            except Exception as e:  # never let one bad message end the connection
-                reply = _error(_id(message), INTERNAL_ERROR, f"internal error: {type(e).__name__}: {e}")
-        if reply is not None:
-            # ensure_ascii keeps every message on one line whatever the package metadata contains.
-            stdout.write(json.dumps(reply, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n")
+    """Answer messages from stdin until it closes, then wait for the calls still queued or running."""
+    write_lock = threading.Lock()
+
+    def send(reply: object) -> None:
+        # ensure_ascii keeps every message on one line whatever the package metadata contains.
+        data = json.dumps(reply, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n"
+        with write_lock:  # the worker writes too: a line is never split by another
+            stdout.write(data)
             stdout.flush()
+
+    server = Server(send)
+    finished = False
+    try:
+        for line in stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line.decode("utf-8-sig"))
+            except (ValueError, RecursionError) as e:  # bad UTF-8 or JSON, an over-long integer, absurd nesting
+                reply: object = _error(None, PARSE_ERROR, f"parse error: {type(e).__name__}")
+            else:
+                try:
+                    reply = server.handle(message)
+                except Exception as e:  # never let one bad message end the connection
+                    reply = _error(_id(message), INTERNAL_ERROR, f"internal error: {type(e).__name__}: {e}")
+            if reply is not None:
+                send(reply)
+        finished = True
+    finally:
+        server.close(wait=finished)  # on Ctrl-C, don't start the calls still queued
 
 
 def main(argv: list[str] | None = None) -> int:
