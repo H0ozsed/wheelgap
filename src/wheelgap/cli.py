@@ -17,7 +17,7 @@ import packaging
 from packaging.markers import InvalidMarker, Marker
 from packaging.utils import canonicalize_name
 
-from . import __version__
+from . import __version__, cache
 from .api import running_python
 from .check import CELL, Row, Status, check, explain, has_sdist, marker_holds, reachable
 from .dockerfile import DockerfileError, read_dockerfile
@@ -187,6 +187,11 @@ def make_parser() -> argparse.ArgumentParser:
         "--no-cache",
         action="store_true",
         help="don't read or save the 24-hour cache of pinned package lookups",
+    )
+    p.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="delete the cache of pinned package lookups first; with no INPUT, do only that",
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
@@ -867,6 +872,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.offline and args.online:
         parser.error("--offline and --online can't be used together")
     try:
+        if args.clear_cache:
+            folder, count = cache.clear()
+            print(f"wheelgap: removed {count} cached lookup{'' if count == 1 else 's'} from {folder}", file=sys.stderr)
+            if not args.inputs:
+                return 0
         if args.list_targets:
             pyproject = find_pyproject(args.inputs)
             print_target_list(args, load_config(pyproject) if pyproject else {})

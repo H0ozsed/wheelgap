@@ -9,6 +9,7 @@ import contextlib
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -16,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 MAX_AGE = 24 * 60 * 60  # seconds: new wheels for an existing release show up within a day
+PRUNE_EVERY = 24 * 60 * 60  # seconds between two prunes of expired entries
 
 
 def _now() -> float:
@@ -71,6 +73,7 @@ def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump({"saved": _now(), "files": kept}, f)
+            os.utime(tmp, (_now(), _now()))  # prune() reads the age from the mtime
             os.replace(tmp, path)
         except BaseException:
             with contextlib.suppress(OSError):
@@ -78,3 +81,33 @@ def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
             raise
     except Exception:  # read-only home, full disk, a race on Windows...: the next run just looks it up again
         pass
+    prune()
+
+
+def prune(max_age: float = MAX_AGE) -> None:
+    """Delete entries older than max_age, which load_files would ignore anyway. Runs at most once a day:
+    a `last-prune` marker next to the entries holds the time of the last run in its mtime."""
+    try:
+        folder = cache_dir()
+        marker = folder / "last-prune"
+        with contextlib.suppress(FileNotFoundError):
+            if 0 <= _now() - marker.stat().st_mtime < PRUNE_EVERY:
+                return
+        marker.touch()
+        os.utime(marker, (_now(), _now()))
+        for entry in folder.glob("*.json"):
+            with contextlib.suppress(OSError):  # another run may have replaced or removed it
+                if _now() - entry.stat().st_mtime >= max_age:
+                    entry.unlink()
+    except OSError:  # no folder yet, or one we can't list: try again next time
+        pass
+
+
+def clear() -> tuple[Path, int]:
+    """Delete the whole cache folder (--clear-cache). Returns the folder and how many entries it held."""
+    folder = cache_dir()
+    if not folder.exists():
+        return folder, 0
+    count = sum(1 for _ in folder.glob("*.json"))
+    shutil.rmtree(folder)
+    return folder, count
