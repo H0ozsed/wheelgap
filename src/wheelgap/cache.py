@@ -92,9 +92,13 @@ def save_files(index: str, name: str, version: str, files: list[dict]) -> None:
 def _own_folder(folder: Path) -> bool:
     """The cache folder is a real directory, not a symlink or Windows junction to somewhere else."""
     try:
-        if not stat.S_ISDIR(os.lstat(folder).st_mode):
-            return False
+        info = os.lstat(folder)
     except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    # Python 3.11 on Windows reports a junction as a plain folder; its reparse tag gives it away.
+    if getattr(info, "st_reparse_tag", 0) and info.st_reparse_tag == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", -1):
         return False
     isjunction = getattr(os.path, "isjunction", None)  # Python 3.12+
     return not (isjunction is not None and isjunction(folder))
