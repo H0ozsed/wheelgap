@@ -875,7 +875,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.clear_cache:
             folder, count = cache.clear()
             print(f"wheelgap: removed {count} cached lookup{'' if count == 1 else 's'} from {folder}", file=sys.stderr)
-            if not args.inputs:
+            if not args.inputs and not args.list_targets:
                 return 0
         if args.list_targets:
             pyproject = find_pyproject(args.inputs)

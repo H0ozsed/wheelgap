@@ -342,3 +342,75 @@ def test_clear_cache_with_inputs_clears_then_runs(capsys, fake_pypi, pinned, loo
 def test_clear_cache_with_no_cache_folder(capsys, lookup_cache):
     lookup_cache.rmdir()
     assert run(capsys, "--clear-cache") == (0, "", f"wheelgap: removed 0 cached lookups from {lookup_cache}\n")
+
+
+ENTRY_NAME = "0" * 64 + ".json"
+
+
+def test_prune_deletes_only_its_own_old_files(monkeypatch, lookup_cache):
+    now = 1_800_000_000.0
+    monkeypatch.setattr(cache, "_now", lambda: now)
+    old = now - cache.MAX_AGE
+    names = [ENTRY_NAME, ".tmp-abc.json", "notes.json", "README", "1" * 64 + ".json"]
+    for name in names:
+        (lookup_cache / name).write_text("{}", encoding="utf-8")
+        os.utime(lookup_cache / name, (old, old))
+    os.utime(lookup_cache / ("1" * 64 + ".json"), (now, now))  # a fresh entry
+    cache.prune()
+    left = sorted(p.name for p in lookup_cache.iterdir())
+    # The old entry and the leftover of an interrupted save go; someone else's files and the fresh entry stay.
+    assert left == sorted(["notes.json", "README", "1" * 64 + ".json", "last-prune"])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+def test_prune_marker_is_private(lookup_cache):
+    cache.prune()
+    assert (lookup_cache / "last-prune").stat().st_mode & 0o777 == 0o600
+
+
+def _symlinked_cache(tmp_path, monkeypatch):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    victim = elsewhere / ENTRY_NAME
+    victim.write_text("{}", encoding="utf-8")
+    os.utime(victim, (0, 0))  # ancient
+    link = tmp_path / "pinned-v1"
+    try:
+        link.symlink_to(elsewhere, target_is_directory=True)
+    except OSError:
+        pytest.skip("can't create symlinks here")
+    monkeypatch.setattr(cache, "cache_dir", lambda: link)
+    return link, victim
+
+
+def test_prune_and_clear_never_follow_a_symlinked_folder(capsys, monkeypatch, tmp_path):
+    link, victim = _symlinked_cache(tmp_path, monkeypatch)
+    cache.prune()
+    assert victim.exists() and not (link / "last-prune").exists()
+    code, out, err = run(capsys, "--clear-cache")
+    assert code == 2 and not out
+    assert "is a link or not a folder" in err
+    assert victim.exists()
+
+
+def test_clear_leaves_other_files_and_the_folder(capsys, lookup_cache):
+    (lookup_cache / ENTRY_NAME).write_text("{}", encoding="utf-8")
+    (lookup_cache / "notes.json").write_text("{}", encoding="utf-8")
+    code, _, err = run(capsys, "--clear-cache")
+    assert code == 0 and err == f"wheelgap: removed 1 cached lookup from {lookup_cache}\n"
+    assert [p.name for p in lookup_cache.iterdir()] == ["notes.json"]
+
+
+def test_no_home_folder_never_fails_a_run(capsys, fake_pypi, pinned, monkeypatch):
+    def no_home():
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(cache, "cache_dir", no_home)
+    code, _, _ = run(capsys, pinned, "-p", "3.13", "-t", "linux-x86_64")
+    assert code == 0
+    assert fake_pypi == [FASTLIB]
+
+
+def test_clear_cache_with_list_targets_still_lists(capsys, lookup_cache):
+    code, out, err = run(capsys, "--clear-cache", "--list-targets")
+    assert code == 0 and "linux-x86_64" in out and err.startswith("wheelgap: removed")
